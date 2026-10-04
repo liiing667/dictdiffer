@@ -8,7 +8,8 @@
 from collections.abc import Iterable, MutableMapping, MutableSequence, MutableSet
 from copy import deepcopy
 
-from .utils import EPSILON, PathLimit, are_different, dot_lookup
+from .utils import (EPSILON, PathLimit, are_different, create_dotted_node,
+                    dot_lookup)
 from .version import __version__
 
 (ADD, REMOVE, CHANGE) = (
@@ -26,6 +27,10 @@ try:
     LIST_TYPES += (numpy.ndarray, )
 except ImportError:  # pragma: no cover
     HAS_NUMPY = False
+
+# Container types that ``diff`` descends into and that can therefore be part
+# of a reference cycle (sets can only contain hashable items and never are).
+RECURSIVE_CONTAINER_TYPES = DICT_TYPES + LIST_TYPES
 
 
 def diff(first, second, node=None, ignore=None, path_limit=None, expand=False,
@@ -120,6 +125,11 @@ def diff(first, second, node=None, ignore=None, path_limit=None, expand=False,
 
     .. versionchanged:: 0.8
         Added *dot_notation* parameter.
+
+    .. versionchanged:: 0.11
+       Handles circular references. A cycle that closes at the same path on
+       both sides is considered equal, otherwise a ``change`` is reported
+       at the path where the cycle closes.
     """
     if path_limit is not None and not isinstance(path_limit, PathLimit):
         path_limit = PathLimit(path_limit)
@@ -145,8 +155,41 @@ def diff(first, second, node=None, ignore=None, path_limit=None, expand=False,
         else:
             return default_type(node)
 
-    def _diff_recursive(_first, _second, _node=None):
+    def _diff_recursive(_first, _second, _node=None, _first_ids=None,
+                        _second_ids=None):
         _node = _node or []
+        if _first_ids is None:
+            _first_ids = {}
+        if _second_ids is None:
+            _second_ids = {}
+
+        # Cycle detection: the id maps keep the path (node) at which every
+        # container on the current recursion branch was first encountered.
+        # Revisiting an ancestor means that both structures are cyclic. When
+        # the cycle closes at the same node on both sides the structures are
+        # identical; otherwise the shape of the cycle differs.
+        first_is_container = isinstance(
+            _first, RECURSIVE_CONTAINER_TYPES)
+        second_is_container = isinstance(
+            _second, RECURSIVE_CONTAINER_TYPES)
+        if first_is_container or second_is_container:
+            first_seen = _first_ids.get(id(_first)) \
+                if first_is_container else None
+            second_seen = _second_ids.get(id(_second)) \
+                if second_is_container else None
+            if first_seen is not None or second_seen is not None:
+                if first_seen is not None and first_seen == second_seen:
+                    return
+                yield CHANGE, dotted(_node), (
+                    deepcopy(_first), deepcopy(_second)
+                )
+                return
+            if first_is_container:
+                _first_ids = dict(_first_ids)
+                _first_ids[id(_first)] = _node
+            if second_is_container:
+                _second_ids = dict(_second_ids)
+                _second_ids[id(_second)] = _node
 
         dotted_node = dotted(_node)
 
@@ -203,16 +246,36 @@ def diff(first, second, node=None, ignore=None, path_limit=None, expand=False,
                 # callees again diff function to compare.
                 # otherwise, the change will be handled as `change` flag.
                 if path_limit and path_limit.path_is_limit(_node + [key]):
-                    if _first[key] == _second[key]:
+                    first_value = _first[key]
+                    second_value = _second[key]
+                    if isinstance(first_value, RECURSIVE_CONTAINER_TYPES) \
+                            and isinstance(second_value,
+                                           RECURSIVE_CONTAINER_TYPES):
+                        # Guard the `==` shortcut against reference cycles
+                        # that would make the comparison recurse forever.
+                        first_seen = _first_ids.get(id(first_value))
+                        second_seen = _second_ids.get(id(second_value))
+                        if first_seen is not None or second_seen is not None:
+                            if first_seen is not None \
+                                    and first_seen == second_seen:
+                                return
+                            yield CHANGE, _node + [key], (
+                                deepcopy(first_value),
+                                deepcopy(second_value),
+                            )
+                            continue
+                    if first_value == second_value:
                         return
 
                     yield CHANGE, _node + [key], (
-                        deepcopy(_first[key]), deepcopy(_second[key])
+                        deepcopy(first_value), deepcopy(second_value)
                     )
                 else:
                     recurred = _diff_recursive(
                         _first[key], _second[key],
                         _node=_node + [key],
+                        _first_ids=_first_ids,
+                        _second_ids=_second_ids,
                     )
 
                     for diffed in recurred:
@@ -234,6 +297,8 @@ def diff(first, second, node=None, ignore=None, path_limit=None, expand=False,
                                 _second[key].__class__(),
                                 _second[key],
                                 _node=_node + [key],
+                                _first_ids=_first_ids,
+                                _second_ids=_second_ids,
                             )
 
                             collect_recurred.append(recurred)
@@ -278,6 +343,69 @@ def diff(first, second, node=None, ignore=None, path_limit=None, expand=False,
     return _diff_recursive(first, second, node)
 
 
+def _has_cycle(value):
+    """Check whether a (nested) structure contains a reference cycle.
+
+    >>> _has_cycle({'a': [1, 2, {'b': 'c'}]})
+    False
+    >>> value = {}
+    >>> value['self'] = value
+    >>> _has_cycle(value)
+    True
+    >>> shared = {'b': 'c'}
+    >>> _has_cycle([shared, shared])
+    False
+    """
+    containers = RECURSIVE_CONTAINER_TYPES + SET_TYPES + (tuple, frozenset)
+    if not isinstance(value, containers):
+        return False
+
+    explored = set()  # ids of fully explored containers
+    active = set()  # ids of containers on the current path
+    stack = [(value, True)]
+    while stack:
+        node, entering = stack.pop()
+        node_id = id(node)
+        if entering:
+            if node_id in active:
+                return True
+            if node_id in explored:
+                continue
+            active.add(node_id)
+            stack.append((node, False))
+            if isinstance(node, DICT_TYPES):
+                children = list(node.keys()) + list(node.values())
+            else:
+                children = list(node)
+            for child in children:
+                if isinstance(child, containers):
+                    stack.append((child, True))
+        else:
+            active.discard(node_id)
+            explored.add(node_id)
+    return False
+
+
+def _check_cyclic_changes(action, node, changes):
+    """Raise a ValueError if a diff item contains a reference cycle."""
+    if isinstance(node, str):
+        keys = node.split('.') if node else []
+    else:
+        keys = list(node)
+
+    if action == CHANGE:
+        suspects = [(keys, changes[0]), (keys, changes[1])]
+    else:
+        suspects = [(keys + [key], value) for key, value in changes]
+
+    for path, value in suspects:
+        if _has_cycle(value):
+            raise ValueError(
+                'Cannot apply a self-referencing (cyclic) value '
+                'at path {0!r}.'.format(create_dotted_node(path))
+            )
+
+
 def patch(diff_result, destination, in_place=False):
     """Patch the diff result to the destination dictionary.
 
@@ -288,6 +416,10 @@ def patch(diff_result, destination, in_place=False):
                      Setting ``in_place=True`` means that patch will apply
                      the changes directly to and return the destination
                      structure.
+
+    .. versionchanged:: 0.11
+       Raises :exc:`ValueError` when a diff item contains a self-referencing
+       (cyclic) value instead of recursing forever.
     """
     if not in_place:
         destination = deepcopy(destination)
@@ -328,6 +460,7 @@ def patch(diff_result, destination, in_place=False):
     }
 
     for action, node, changes in diff_result:
+        _check_cyclic_changes(action, node, changes)
         patchers[action](node, changes)
 
     return destination

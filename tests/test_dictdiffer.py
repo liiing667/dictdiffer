@@ -687,6 +687,138 @@ class DiffPatcherTests(unittest.TestCase):
         assert first == patched_in_place
 
 
+class CircularReferencesTests(unittest.TestCase):
+    def test_same_self_referencing_structure(self):
+        first = {'n': 1}
+        first['self'] = first
+        second = {'n': 1}
+        second['self'] = second
+        assert list(diff(first, second)) == []
+
+    def test_diff_of_identical_cyclic_object(self):
+        value = {'n': 1}
+        value['self'] = value
+        assert list(diff(value, value)) == []
+
+    def test_change_inside_cyclic_structure(self):
+        first = {'n': 1}
+        first['self'] = first
+        second = {'n': 2}
+        second['self'] = second
+        assert list(diff(first, second)) == [('change', 'n', (1, 2))]
+
+    def test_different_cycle_shape(self):
+        first = {'n': 1}
+        first['self'] = first
+        middle = {'n': 1}
+        second = {'n': 1, 'self': middle}
+        middle['self'] = second
+        (change,) = diff(first, second)
+        assert change[0] == 'change'
+        assert change[1] == 'self'
+
+    def test_different_cycle_shape_path(self):
+        first = {'a': {'n': 1}}
+        first['a']['self'] = first['a']
+        middle = {'n': 1}
+        second = {'a': {'n': 1, 'self': middle}}
+        middle['self'] = second['a']
+        (change,) = diff(first, second)
+        assert change[1] == 'a.self'
+
+    def test_different_cycle_shape_without_dot_notation(self):
+        first = {'a': {}}
+        first['a']['self'] = first['a']
+        middle = {}
+        second = {'a': {'self': middle}}
+        middle['self'] = second['a']
+        (change,) = diff(first, second, dot_notation=False)
+        assert change[1] == ['a', 'self']
+
+    def test_same_mutual_reference(self):
+        first_one = {'name': 'one'}
+        first_two = {'name': 'two'}
+        first_one['other'] = first_two
+        first_two['other'] = first_one
+        second_one = {'name': 'one'}
+        second_two = {'name': 'two'}
+        second_one['other'] = second_two
+        second_two['other'] = second_one
+        assert list(diff(first_one, second_one)) == []
+
+    def test_mutual_reference_versus_self_reference(self):
+        first_one = {}
+        first_two = {}
+        first_one['other'] = first_two
+        first_two['other'] = first_one
+        second = {}
+        second['other'] = second
+        (change,) = diff(first_one, second)
+        assert change == ('change', 'other', change[2])
+
+    def test_cycle_through_list(self):
+        first = {'items': []}
+        first['items'].append(first)
+        second = {'items': []}
+        second['items'].append(second)
+        assert list(diff(first, second)) == []
+
+        second['items'].append(second)
+        (change,) = diff(first, second)
+        assert change[0] == 'add'
+
+    def test_different_cycle_closure(self):
+        first = {'x': {}}
+        first['x']['back'] = first['x']
+        second = {'x': {}}
+        second['x']['back'] = second
+        (change,) = diff(first, second)
+        assert change[1] == 'x.back'
+
+    def test_shared_reference_without_cycle(self):
+        shared_first = {'v': 1}
+        shared_second = {'v': 1}
+        assert list(diff(
+            {'p': shared_first, 'q': shared_first},
+            {'p': shared_second, 'q': shared_second})) == []
+        assert list(diff(
+            {'p': shared_first, 'q': shared_first},
+            {'p': shared_second, 'q': {'v': 2}})) == \
+            [('change', 'q.v', (1, 2))]
+
+    def test_patch_rejects_cyclic_value(self):
+        cyclic = {}
+        cyclic['self'] = cyclic
+        with pytest.raises(ValueError) as exc:
+            patch([('add', '', [('x', cyclic)])], {})
+        assert "'x'" in str(exc.value)
+
+        with pytest.raises(ValueError) as exc:
+            patch([('change', 'a.self', (1, cyclic))],
+                  {'a': {'self': 1}})
+        assert 'a.self' in str(exc.value)
+
+        with pytest.raises(ValueError) as exc:
+            patch([('remove', 'a', [('x', cyclic)])],
+                  {'a': {'x': 1}})
+        assert 'a.x' in str(exc.value)
+
+    def test_revert_rejects_cyclic_value(self):
+        cyclic = {}
+        cyclic['self'] = cyclic
+        with pytest.raises(ValueError) as exc:
+            revert([('change', 'a.self', (cyclic, 2))],
+                   {'a': {'self': 2}})
+        assert 'a.self' in str(exc.value)
+
+    def test_patch_of_cyclic_destination(self):
+        destination = {'n': 1}
+        destination['self'] = destination
+        patched = patch([('change', 'n', (1, 2))], destination)
+        assert patched['n'] == 2
+        assert patched['self'] is patched
+
+
 class SwapperTests(unittest.TestCase):
     def test_addition(self):
         result = 'add', '', [('a', 'b')]

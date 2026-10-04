@@ -1,6 +1,14 @@
 Changes
 =======
 
+Version 0.11.0 (unreleased)
+
+- diff: support circular references; identical cycles are considered equal
+  and cycles of different shape are reported as a change at the path where
+  the cycle closes
+- patch/revert: raise a ValueError with the offending path when a diff item
+  contains a self-referencing (cyclic) value
+
 Version v0.10.0 (released 2026-07-16)
 
 - chore(setup): migrate from setuptools to hatchling
